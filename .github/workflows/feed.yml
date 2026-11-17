@@ -1,0 +1,56 @@
+name: feed
+on:
+  schedule:
+    - cron: '11,41 * * * *'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: feed
+  cancel-in-progress: false
+jobs:
+  feed:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch and verify the signed feed
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 --retry-delay 5 -o /tmp/feed.json \
+            https://whaleclient.oss-me-east-1.aliyuncs.com/fallback/gh-feed-v2.json
+          pip install --quiet cryptography
+          python3 - <<'PY'
+          import base64, json, sys, time
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+          KEYS = {"ios-primary": "zdP0AOJ-RD3QxqpKxdZRNbdWT9IfBRvVRZmnmddz2yc"}
+          b64 = lambda s: base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+          env = json.load(open("/tmp/feed.json"))
+          assert set(env) == {"schema", "alg", "key_id", "payload", "signature"}, "envelope fields"
+          assert env["schema"] == 2 and env["alg"] == "Ed25519" and env["key_id"] in KEYS, "envelope shape"
+          payload = b64(env["payload"])
+          Ed25519PublicKey.from_public_bytes(b64(KEYS[env["key_id"]])).verify(b64(env["signature"]), payload)
+          body = json.loads(payload)
+          now = int(time.time())
+          assert body["issued_at"] <= now + 300, "issued in the future"
+          assert body["expires_at"] - now > 2 * 86400, "feed is stale (publisher not running?)"
+          assert 1 <= len(body["gateways"]) <= 16, "gateway count"
+          assert all(g["provider"] in ("tencent-eo", "aliyun-esa", "cloudflare") for g in body["gateways"]), "non-CDN gateway in public feed"
+          print("verified", len(body["gateways"]), "gateways, expires", time.strftime("%Y-%m-%d %H:%M", time.gmtime(body["expires_at"])))
+          PY
+      - name: Publish if changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p feed
+          if cmp -s /tmp/feed.json feed/feed.json; then echo "unchanged"; exit 0; fi
+          cp /tmp/feed.json feed/feed.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add feed/feed.json
+          git commit -m "Update feed"
+          git push
+          gh release view feed -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create feed -R "$GITHUB_REPOSITORY" --title "feed" --latest=false --notes "Signed feed (schema 2, Ed25519)."
+          gh release upload feed feed/feed.json -R "$GITHUB_REPOSITORY" --clobber
